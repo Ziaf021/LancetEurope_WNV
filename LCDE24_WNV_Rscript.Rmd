@@ -1,0 +1,1128 @@
+---
+title: 'Climate suitability for infectious disease transmission- West Nile virus'
+author: "Zia Farooq"
+date: "04/08/2022"
+output: html_document
+---
+
+# libraries needed
+```{r}
+library(xgboost)
+library(caTools)
+library(caret)
+library(ROCR)
+library(pROC)
+library(data.table)
+library(here)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(tidymodels)
+library(viridis)
+library(ggrepel)
+library(ggcorrplot)
+library(fastshap)
+library(sf)
+library(readr)
+library(ggpubr)
+```
+
+# Features selection
+select the features to include in the model
+```{r}
+LCD_predictors_NUTS3_1950_21 <- read_csv("~/Old_Mac/Umu_PhD/LCD_Europe/LCDE_2024/all_euro_NUTS3_ERA5_climate_data_29Jan2022.csv")%>%
+            filter(str_length(NUTS_ID)>4)%>%
+            arrange(NUTS_ID,CNTR_CODE, desc(year), .by_group=TRUE)
+  
+LCD_predictors_NUTS3_2022 <- read_csv("~/Old_Mac/Umu_PhD/LCD_Europe/LCDE_2024/GFDL-ESM2M_rcp60NUTS3_data_09Mar2022.csv")%>%
+            filter(str_length(NUTS_ID)>4)%>%
+            arrange(NUTS_ID,CNTR_CODE, desc(year), .by_group=TRUE)%>%
+  filter(year==2022)%>%
+  select(c(1:4,13:16,09:12, 5:8,17:39))%>%
+rename_at(vars(as.vector(c(paste("prec_0", 1:4, sep=''), paste("min_temp_0", 1:4, sep=''), paste("mean_temp_0", 1:4, sep=''), paste("max_temp_0", 1:4, sep='')) ) ), 
+          ~ as.vector( c(paste("total_prec_Q0", 1:4, sep=''), paste("min_temp_Q0", 1:4, sep=''), paste("mean_temp_Q0", 1:4, sep=''), paste("max_temp_Q0", 1:4, sep='')))
+          )
+          
+ #   rename_at(vars(c("prec_01","prec_02", "prec_03", "prec_04")), ~ c("total_prec_Q01","total_prec_Q02", "total_prec_Q03", "total_prec_Q04"))%>%
+
+LCD_predictors_NUTS3<- LCD_predictors_NUTS3_1950_21%>%
+rbind(LCD_predictors_NUTS3_2022)%>%
+left_join(read.csv(paste("/Users/ziafarooq/Old_Mac/Umu_PhD/WNF_project/WNV_Projections/West_Nile_Climate/Pop_and_GDP_proj_data_August_2022/population","ssp1soc","by_NUTS3_Regions_1950_2100.csv", sep='_'))%>%
+  select(c(1,3,4, 6:7))%>%
+  filter(str_length(NUTS_ID)>4),
+  #dplyr::select(-c(2,4))
+  by.x=c("NUTS_ID", "year", "CNTR_CODE"),
+  by.y=c( "NUTS_ID", "year", "CNTR_CODE"), 
+  all.x=T )%>%
+  left_join(read.csv(paste("/Users/ziafarooq/Old_Mac/Umu_PhD/WNF_project/WNV_Projections/West_Nile_Climate/Pop_and_GDP_proj_data_August_2022/gdp_by_NUTS3_Regions_1950_2099.csv", sep='_'))%>%
+  select(c(1,3,4, 6:7))%>%
+  filter(str_length(NUTS_ID)>4),
+  #dplyr::select(-c(2,4))
+  by.x=c("NUTS_ID", "year", "CNTR_CODE"),
+  by.y=c( "NUTS_ID", "year", "CNTR_CODE"), 
+  all.x=T )
+  
+  
+library(eurostat)
+EU_NUTS3 <- get_eurostat_geospatial(resolution = 10,nuts_level = 3, 
+                                                            year = 2021)#%>%
+ # mutate(long= st_coordinates(st_centroid(EU_NUTS3$geometry))[1])%>%
+ # mutate(lat= st_coordinates(st_centroid(EU_NUTS3$geometry))[2])%>%
+ # left_join(WNV_Regs_already_infected,
+ #           by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+ #           all.x=TRUE)
+EU_NUTS3_area <-  EU_NUTS3[,c("NUTS_ID", "geometry")]%>%
+  mutate(#.before = 44,
+    area = st_area(geometry),
+    areakm2 = as.numeric(units::set_units(area, km^2)))%>%
+  dplyr::select(c(1,4))
+
+LCD_predictors_NUTS3 <- LCD_predictors_NUTS3%>%
+left_join(  EU_NUTS3_area%>%
+              st_drop_geometry()%>%
+               distinct(NUTS_ID,areakm2 )%>%
+                filter(str_length(NUTS_ID)>4)%>%
+                arrange(NUTS_ID),
+              
+              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+              
+              all.x=TRUE )%>%
+    mutate(pop_density= population/areakm2)
+
+
+#pop_data<- read.csv(paste("/Users/ziafarooq/Old_Mac/Umu_PhD/WNF_project/WNV_Projections/West_Nile_Climate/Pop_and_GDP_proj_data_August_2022/population","ssp1soc","by_NUTS3_Regions_1950_2100.csv", sep='_'))%>%
+# select(c(1,3,4, 6:7))
+
+#gdp_data<- read.csv(paste("/Users/ziafarooq/Old_Mac/Umu_PhD/WNF_project/WNV_Projections/West_Nile_Climate/Pop_and_GDP_proj_data_August_2022/gdp_by_NUTS3_Regions_1950_2099.csv", sep='_'))%>%
+ # select(c(1,3,4, 6:7))
+
+names(LCD_predictors_NUTS3)
+
+
+ #pop_data<- read.csv(paste("/Users/ziafarooq/Old_Mac/Umu_PhD/WNF_project/WNV_Projections/West_Nile_Climate/Pop_and_GDP_proj_data_August_2022/population","ssp1soc","by_NUTS3_Regions_1950_2100.csv", sep='_'))
+
+#write.csv(WNV_cases,file="WNV_cases.csv")
+```
+
+```{r}
+#LCD_predictors_NUTS3 <- LCD_predictors_NUTS3%>%
+ # filter(str_length(NUTS_ID)>4)%>%
+  #arrange(NUTS_ID,CNTR_CODE, desc(year), .by_group=TRUE)
+
+df_WNVCases_2010_22  <- read.csv("~/Old_Mac/Umu_PhD/LCD_Europe/LCDE_2024/LCDE24_WNVCases_2010_21.csv")%>%
+  dplyr::select(c(2:5))%>%
+  rbind(
+  read.csv("~/Old_Mac/Umu_PhD/LCD_Europe/LCDE_2024/LCDE24_WNVCases_2022.csv")%>%
+    mutate(year= as.numeric(year))%>%
+    mutate(wnf_sum= as.numeric(wnf_sum))%>%
+    dplyr::select(c(1,2,4,10))
+  )
+
+
+
+
+LCD_all_data <-  merge(LCD_predictors_NUTS3,df_WNVCases_2010_22,by.x=c("NUTS_ID", "year", "CNTR_CODE"),
+                            by.y=c( "NUTS_ID", "year", "CNTR_CODE"), all.x=T)%>%
+  mutate_at(c("wnf_sum"),~replace_na(.x, 0))%>% 
+  mutate(wnf_case= ifelse(wnf_sum>0,"1","0"))%>%
+  mutate(wnf_case = factor(wnf_case, 
+                           levels = c("1", "0")))%>%na.omit()
+  
+dim(LCD_all_data)
+
+#names(read_csv("WNV_cases.csv"))
+```
+
+## Split the data into training and test sets
+Here the data set is splitted into training and test sets
+```{r}
+
+LCD_training <- 
+  LCD_all_data%>%
+  filter(year %in% c(2010:2019))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  dplyr::select(-c(1:4,40,42,44))
+  #dplyr::select(-c(1:4,40:44))
+
+LCD_test <- LCD_all_data%>% 
+  filter (year %in% c(1950:2009, 2020:2022))%>%
+    filter(str_length(NUTS_ID)>4)%>%
+  dplyr::select(-c(1:4,40,42,44))
+#dplyr::select(-c(1:4,40:44))
+
+```
+
+
+```{r}
+LCD_label_training <- as.numeric(levels(LCD_training$wnf_case))[LCD_training$wnf_case]
+dMtrxTrain = xgb.DMatrix(as.matrix(sapply(LCD_training[,-dim(LCD_training)[2]], as.numeric)), label=LCD_label_training)
+
+label_LCD_test <- as.numeric(levels(LCD_test$wnf_case))[LCD_test$wnf_case]
+LCD_dMtrxTest = xgb.DMatrix(as.matrix(sapply(LCD_test[,-dim(LCD_test)[2]], as.numeric)), label=label_LCD_test)
+
+
+```
+
+## calculate the scale_pos_weight:
+Calculate "scale positive weight" parameter: an xgb parameter to handle imbalanced data, as in our case.
+
+```{r}
+# Calculate scale_pos_weight: an xgb parameter to handle imbalanced data, as in our case.
+class_count <- table(LCD_training$wnf_case)
+Prm_scale_pos_weight <- class_count[2] / class_count[1]
+
+```
+## Assign the tuned values to the hyperparameters:
+
+```{r}
+# XGBoost parameters: This hyper-parameters set is tuned one
+LCD_params.xgb <- list(booster = "gbtree", 
+                   objective = "binary:logistic", 
+                   eta = 0.36, 
+                   gamma=0.2 ,
+                   lambda= 0.4,
+                   max_depth= 30,
+                   min_child_weight = 5,# ,
+                  max_delta_step=0.1,#9,
+                   scale_pos_weight =Prm_scale_pos_weight #16.18 #
+                   )
+
+```
+## K-fold cross-validation:
+Calculate scale_pos_weight: an xgb parameter to handle imbalanced data, as in our case.
+
+```{r}
+LCD_xgbcv <- xgb.cv(params = LCD_params.xgb,
+                data = dMtrxTrain, 
+                nrounds = 1000, 
+                nfold = 5, 
+                showsd = F,
+                eval_metric =c('logloss', 'auc'), #
+                prediction = T,
+                stratified = T, 
+                print_every_n = 1, 
+                early_stopping_rounds = 30, 
+                maximize = F)
+
+set.seed(1)
+
+```
+## Training/validation:
+Here the model training and validation is performed and observed based on the evaluation metrics.
+```{r}
+watchlist = list( #
+                 LCD_test = LCD_dMtrxTest,
+                 train = dMtrxTrain ) 
+
+model.xgb <- xgb.train( params = LCD_params.xgb,
+                       data = dMtrxTrain, 
+                       nrounds = 1000, 
+                       #nrounds = LCD_xgbcv$best_iteration,
+                       watchlist = watchlist, 
+                       print_every_n = 1, 
+                       early_stopping_rounds = 30, 
+                       maximize = F#, 
+                       )
+```
+
+##set classification threshold:Estimate ROC 
+```{r}
+thresholdValue <- 0.1
+trn_class_thrshold <- thresholdValue
+trn_vld <- fct_rev(as.factor(ifelse(LCD_xgbcv$pred>trn_class_thrshold,1,0)))
+Roc_train <- roc(LCD_label_training, LCD_xgbcv$pred)
+Roc_train
+
+
+
+```
+
+## Model predictions: for years 1950-2009 and 2020
+Test the model on test set,set threshold, calculate and draw confusion-matrix, and estimate roc
+```{r}
+## predict results for test_2018 data
+LCD_xgb_pred <- predict(model.xgb, LCD_dMtrxTest)
+#calculate roc_auc for test_2018
+ROC_test <- roc(label_LCD_test, LCD_xgb_pred)
+ROC_test
+```
+
+## combine the  predictions of train and test preiods, create NUTS3/ Country-Wise CSV file 
+```{r}
+df_wnv_pred_probs <- LCD_all_data%>%
+  dplyr::select(c(1:4))%>%
+  #filter(year %in% c(1950:2009))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4))%>%
+           #filter(year %in% c(2010:2022))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+    arrange(NUTS_ID,year)
+
+write.csv(df_wnv_pred_probs[,c(2,1,3:5)], file = "LCDE_132_eur_NUTS3_1950_2022_2024_data.csv")
+
+df_WNV_EU_CNTRY_1950to2022 <- df_wnv_pred_probs%>%group_by(year,CNTR_CODE)%>%
+   summarize(mean_risk_prob= mean(pred_prob))#%>%
+
+  write.csv(df_WNV_EU_CNTRY_1950to2022, file = "LCDE_132_eur_Country_1950_2022_2024_data.csv")
+
+```
+
+#Upload EU_regions Shape files
+```{r}
+shape_CE_Europe <- read_sf(paste(getwd(), '/Shapefiles/CE_Europe/CE_Europe.shp',sep = ''))%>%
+   mutate(EU_reg= "CE_Europe")
+ 
+ shape_North_Europe <- read_sf(paste(getwd(), '/Shapefiles/North_Europe/North_Europe.shp',sep = ''))%>%
+   mutate(EU_reg= "North_Europe")
+ 
+ shape_South_Europe <- read_sf(paste(getwd(), '/Shapefiles/South_Europe/South_Europe.shp',sep = ''))%>%
+   mutate(EU_reg= "South_Europe")
+ 
+ shape_West_Europe <- read_sf(paste(getwd(), '/Shapefiles/West_Europe/West_Europe.shp',sep = ''))%>%
+   mutate(EU_reg= "West_Europe")
+ shape_Europe_regions <- read_sf(paste(getwd(), '/Shapefiles/Europe_regions/Europe_regions.shp',sep = ''))%>%
+   mutate(EU_reg= "Europe_regions")
+
+```
+
+## Create European Regions and Europe's CSV file 
+```{r}
+df_pred_probs_EU_RegWise <- df_wnv_pred_probs%>%filter(CNTR_CODE %in% shape_CE_Europe$CNTR_CODE )%>%
+   mutate(EU_reg= "CE_Europe")%>%
+   rbind(
+     df_wnv_pred_probs%>%
+       filter(CNTR_CODE %in% shape_North_Europe$CNTR_CODE )%>%
+           mutate(EU_reg= "North_Europe")
+     )%>%
+   rbind(
+     df_wnv_pred_probs%>%
+       filter(CNTR_CODE %in% shape_South_Europe$CNTR_CODE | CNTR_CODE=="EL" )%>%
+       #filter(CNTR_CODE=="EL")%>%
+       mutate(EU_reg= "South_Europe")
+   )%>%
+   rbind(
+     df_wnv_pred_probs%>%
+       filter(CNTR_CODE %in% shape_West_Europe$CNTR_CODE | CNTR_CODE=="UK" )%>%
+       #filter(CNTR_CODE=="UK")%>%
+       mutate(EU_reg= "West_Europe")
+   )%>%
+   rbind(
+     df_wnv_pred_probs%>%
+       mutate(EU_reg= "All_Europe")
+     
+   )%>%mutate(EU_reg= as.factor(EU_reg))%>%
+   group_by(year,EU_reg)%>%
+   summarize(mean_risk_prob= mean(pred_prob))
+ 
+df_pred_probs_EU_RegWise
+
+write.csv(df_pred_probs_EU_RegWise%>%filter(EU_reg!="All_Europe")
+             , file = "LCDE_132_eur_regions_1950_2022_2024_data.csv")
+
+write.csv(df_pred_probs_EU_RegWise%>%filter(EU_reg=="All_Europe")
+             , file = "LCDE_132_eur_eur_1950_2022_2024_data.csv")
+
+
+
+
+```
+
+
+## Percent Changes
+```{r}
+## Estimate the probabilities
+ #df_Mean_risk_EU_RegWise
+ 
+ df_PrcntChangeRisk <- df_pred_probs_EU_RegWise%>%
+    filter(year %in% c(1951:1960))%>%
+    group_by(EU_reg)%>%
+    summarize(mean_prob_1950to1959= mean(mean_risk_prob))%>%
+   # mutate(avg_years= "1950-1959" )%>%
+    cbind(
+       df_pred_probs_EU_RegWise%>%
+          filter(year %in% c(2011:2022))%>%
+          group_by(EU_reg)%>%
+          summarize(mean_prob_2011to2022= mean(mean_risk_prob))%>%
+          select(mean_prob_2011to2022)
+    )%>%
+    cbind(
+       df_pred_probs_EU_RegWise%>%
+          filter(year %in% c(1951:2010))%>%
+          group_by(EU_reg)%>%
+          summarize(mean_prob_1951to2022= mean(mean_risk_prob))%>%
+          select(mean_prob_1951to2022)
+    )%>%
+      cbind(
+       df_pred_probs_EU_RegWise%>%
+          filter(year %in% c(1951:1985))%>%
+          group_by(EU_reg)%>%
+          summarize(mean_prob_1951to1986= mean(mean_risk_prob))%>%
+          select(mean_prob_1951to1986)
+    )%>%
+    cbind(
+       df_pred_probs_EU_RegWise%>%
+          filter(year %in% c(1986:2020))%>%
+          group_by(EU_reg)%>%
+          summarize(mean_prob_1987to2022= mean(mean_risk_prob))%>%
+          select(mean_prob_1987to2022)
+    )%>%
+    mutate( prcnt_risk_first_second_Half = ((mean_prob_1987to2022-mean_prob_1951to1986)/mean_prob_1951to1986)*100) %>%
+   cbind(
+   df_pred_probs_EU_RegWise%>%
+     filter(year %in% c(1951:1960))%>%
+     group_by(EU_reg)%>%
+     summarize(mean_prob_1951to1960= mean(mean_risk_prob))%>%
+     select(mean_prob_1951to1960)
+ )%>%
+   cbind(
+     df_pred_probs_EU_RegWise%>%
+       filter(year %in% c(2013:2022))%>%
+       group_by(EU_reg)%>%
+       summarize(mean_prob_2013to2022= mean(mean_risk_prob))%>%
+       select(mean_prob_2013to2022)
+   )%>%
+   mutate( prcnt_risk_10years_1951to60_2013to2022 = ((mean_prob_2013to2022-mean_prob_1951to1960)/mean_prob_1951to1960)*100)%>%
+   cbind(
+     df_pred_probs_EU_RegWise%>%
+       filter(year %in% c(1951:1970))%>%
+       group_by(EU_reg)%>%
+       summarize(mean_prob_1951to1970= mean(mean_risk_prob))%>%
+       select(mean_prob_1951to1970)
+   )%>%
+   cbind(
+     df_pred_probs_EU_RegWise%>%
+       filter(year %in% c(2003:2022))%>%
+       group_by(EU_reg)%>%
+       summarize(mean_prob_2003to2022= mean(mean_risk_prob))%>%
+       select(mean_prob_2003to2022)
+   )%>%
+   mutate( prcnt_risk_20years_1951to70_2003to2022 = ((mean_prob_2003to2022-mean_prob_1951to1970)/mean_prob_1951to1970)*100)%>%
+   cbind(
+     df_pred_probs_EU_RegWise%>%
+       filter(year %in% c(1951:1980))%>%
+       group_by(EU_reg)%>%
+       summarize(mean_prob_1951to1980= mean(mean_risk_prob))%>%
+       select(mean_prob_1951to1980)
+   )%>%
+   cbind(
+     df_pred_probs_EU_RegWise%>%
+       filter(year %in% c(1993:2022))%>%
+       group_by(EU_reg)%>%
+       summarize(mean_prob_1993to2022= mean(mean_risk_prob))%>%
+       select(mean_prob_1993to2022)
+   )%>%
+   mutate( prcnt_risk_30years_1951to80_1993to2022 = ((mean_prob_1993to2022-mean_prob_1951to1980)/mean_prob_1951to1980)*100)
+ 
+ df_PrcntChangeRisk <- 
+ df_PrcntChangeRisk%>%mutate(across(2:16, round,2))
+ 
+ write.csv(df_PrcntChangeRisk, file= "LCDE24_WNV_PrcntChngRisk_comparisons.csv")
+    
+```
+
+# Figures
+## Figure West Nile virus -Main text LCDE 2024
+```{r}
+
+  df_WNVposRegs_EU_RegWise <- df_all_pred_resp%>%filter(CNTR_CODE %in% shape_CE_Europe$CNTR_CODE )%>%
+   mutate(EU_reg= "CE_Europe")%>%
+   rbind(
+     df_all_pred_resp%>%
+       filter(CNTR_CODE %in% shape_North_Europe$CNTR_CODE )%>%
+           mutate(EU_reg= "North_Europe")
+     )%>%
+   rbind(
+     df_all_pred_resp%>%
+       filter(CNTR_CODE %in% shape_South_Europe$CNTR_CODE | CNTR_CODE=="EL" )%>%
+       #filter(CNTR_CODE=="EL")%>%
+       mutate(EU_reg= "South_Europe")
+   )%>%
+   rbind(
+     df_all_pred_resp%>%
+       filter(CNTR_CODE %in% shape_West_Europe$CNTR_CODE | CNTR_CODE=="UK" )%>%
+       #filter(CNTR_CODE=="UK")%>%
+       mutate(EU_reg= "West_Europe")
+   )%>%
+   rbind(
+     df_all_pred_resp%>%
+       mutate(EU_reg= "All_Europe")
+     
+   )%>%mutate(EU_reg= as.factor(EU_reg))%>%
+   group_by(year,EU_reg)%>%
+  count()%>%
+    ungroup()%>%
+    mutate(EU_reg=
+   #summarize(mean_risk_prob= mean(pred_prob))
+  recode_factor(EU_reg , All_Europe= "All Europe", `CE_Europe` = "Eastern Europe", 
+                                                 North_Europe = "Northern Europe", South_Europe= "Southern Europe", West_Europe = "Western Europe"))%>%
+    filter(EU_reg!="All Europe")
+
+```
+
+
+```{r}
+
+df_all_pred_resp <- 
+LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+arrange(NUTS_ID,year) %>%
+  filter(wnf_case==1)
+  
+  
+  
+  
+ # df_pred_probs_EU_RegWise
+  
+  
+
+ df_Mean_risk_EU_RegWise%>%
+   filter( EU_reg != "All Europe" & year != 1950)%>%
+ ggplot(aes(year , 
+            m_prob, color=EU_reg))+
+   geom_line(alpha=0.5)+
+   geom_smooth(
+     method=lm,
+               aes(year , 
+                   m_prob, 
+                   fill=EU_reg
+                   ),
+               alpha=1,
+               lty=2,lwd=0.5,
+               se = FALSE,
+   )+
+   
+    geom_bar(df_WNVposRegs_EU_RegWise, mapping= aes(year , 
+           # n/scal_factor, 
+            n/1000, 
+            fill=EU_reg
+          
+  ), 
+  # geom='GeomBar',
+  stat='identity',
+  position ='stack',
+  alpha=0.5,
+  colour= NA
+  )+ #as.numeric(alpha) 1500
+ scale_fill_manual(labels = c("Eastern Europe","Northern Europe","Southern Europe", "Western Europe",""),#,
+                       values = c(LCD_figColors[1], LCD_figColors[2], LCD_figColors[3], LCD_figColors[4]),
+                       guide = "legend" 
+    )+
+  
+   
+  theme_bw()+
+ #  scale_fill_ptol()+
+  theme_bw()+
+   scale_x_continuous(expand = c(0,0),
+     breaks=seq(1950,2020,10)#,  
+                      )+
+   
+   
+   xlab(" ")+
+   
+   ylab("West Nile virus outbreak risk")+
+   theme(
+         strip.text =element_text(hjust =0),
+         legend.key =element_blank(),
+         legend.text.align =0,
+         panel.grid =element_blank(),
+         legend.key.height =grid::unit(0.2,'cm'),
+         legend.position =  "bottom", #c(0.5, 0.95),## 
+         legend.direction = "horizontal",
+         legend.title = element_blank(),         
+         axis.text =element_text(vjust=0.5,size=10),
+         panel.border =element_blank(),
+         #axis.line.y.left =element_line(size=0.1),
+         axis.line.x.bottom =element_line(size=0.1),
+          axis.line.y.right = element_line(size=0.1),
+         axis.line.y.left =element_line(size=0.1),
+         #axis.line.x.bottom =element_line(size=0.1),
+         axis.ticks.y.right = element_line(color = "black"),
+    axis.title.y.right = element_text(color = "black", size = 10)
+         
+         )+
+   scale_y_continuous( #limits = c(-60, 60),
+     expand = c(0,0),
+    sec.axis = sec_axis( trans=~.*1000, # scal_factor,
+                         name="Number of NUTS3 regions reporting West Nile virus outbreaks"
+    )
+  )+
+   scale_color_manual(labels = c("Eastern Europe","Northern Europe","Southern Europe", "Western Europe",""),#,
+                       values = c(LCD_figColors[1], LCD_figColors[2], LCD_figColors[3], LCD_figColors[4]),
+                       guide = "legend" 
+    )
+
+
+
+
+```
+
+
+
+```{r}
+df_Mean_risk_EU_RegWise <- #df_pred_probs_EU_RegWise%>%
+   df_pred_probs_EU_RegWise%>%
+   #read.csv("/Users/ziafarooq/Old_Mac/Umu_PhD/LCD_Europe/LCDE_2024/LCDE_132_eur_regions_1950_2022_2023_data.csv")%>%
+   mutate(EU_reg= as.factor(EU_reg))%>%
+   group_by(year,EU_reg)%>%
+   summarize(m_prob= mean(mean_risk_prob))
+ 
+ 
+ df_Mean_risk_EU_RegWise$EU_reg <- recode_factor(df_Mean_risk_EU_RegWise$EU_reg , All_Europe= "All Europe", CE_Europe = "Central and Eastern Europe", 
+                                                 North_Europe = "Northern Europe", South_Europe= "Southern Europe", West_Europe = "Western Europe")
+ 
+ 
+ LCD_figColors <- c("#EE3377",	"#33BBEE" , "#EE7733", "#009988")
+ 
+ 
+ df_Mean_risk_EU_RegWise$EU_reg <- recode_factor(df_Mean_risk_EU_RegWise$EU_reg , All_Europe= "All Europe", `Central and Eastern Europe` = "Eastern Europe", 
+                                                 North_Europe = "Northern Europe", South_Europe= "Southern Europe", West_Europe = "Western Europe")
+ 
+ 
+ LCD_WNV_Mainfig <- df_Mean_risk_EU_RegWise%>%
+   filter( EU_reg != "All Europe" & year != 1950)%>%
+ ggplot(aes(year , 
+            m_prob, color=EU_reg))+
+   geom_line()+
+   geom_smooth(
+     method=lm,
+               aes(year , 
+                   m_prob, 
+                   fill=EU_reg
+                   ),
+               alpha=0.1,
+               lty=2,lwd=0.5,
+               se = FALSE,
+   )+
+  theme_bw()+
+   scale_x_continuous(breaks=seq(1950,2020,10)#,  
+                      )+
+   xlab(" ")+
+   
+   ylab("WNV outbreak risk")+
+   theme(
+         strip.text =element_text(hjust =0),
+         legend.key =element_blank(),
+         legend.text.align =0,
+         panel.grid =element_blank(),
+         legend.key.height =grid::unit(0.2,'cm'),
+         legend.position =  "bottom", #c(0.5, 0.95),## 
+         legend.direction = "horizontal",
+         legend.title = element_blank(),         
+         axis.text =element_text(vjust=0.5,size=10),
+         panel.border =element_blank(),
+         axis.line.y.left =element_line(size=0.1),
+         axis.line.x.bottom =element_line(size=0.1))+
+    scale_color_manual(labels = c("Eastern Europe","Northern Europe","Southern Europe", "Western Europe",""),#,
+                       values = c(LCD_figColors[1], LCD_figColors[2], LCD_figColors[3], LCD_figColors[4]),
+                       guide = "legend" 
+    )
+
+ 
+ LCD_WNV_Mainfig
+
+```
+
+##Appendix Figures 
+
+```{r}
+  df_WNV_NUTS_1950_2022 <- df_wnv_pred_probs%>%group_by(year,NUTS_ID)%>%
+   summarize(mean_risk_prob= mean(pred_prob))
+ #df_wnv_proj_prob_maps <-   left_join(  europe_shp21[,c("NUTS_ID", "geometry")],df_WNV_NUTS_1950_2022, 
+ #                             by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+#                              all.y=TRUE )
+
+df_LCD_meanprbs_7tmprlgrps <-  df_WNV_NUTS_1950_2022%>%
+  #st_drop_geometry()
+   filter(year %in% (1951:1960))%>%
+   group_by(NUTS_ID)%>%
+   summarize(pp= mean(mean_risk_prob))%>%
+   mutate(ProbYears=c("1950-1960"))%>%
+  rbind(df_WNV_NUTS_1950_2022%>%
+   filter(year %in% (1961:1970))%>%
+   group_by(NUTS_ID)%>%
+   summarize(pp = mean(mean_risk_prob))%>%
+   mutate(ProbYears= c("1961-1970")) )%>%
+  rbind(df_WNV_NUTS_1950_2022%>%
+   filter(year %in% (1971:1980))%>%
+   group_by(NUTS_ID)%>%
+   summarize(pp = mean(mean_risk_prob))%>%
+   mutate(ProbYears= c("1971-1980")) )%>%
+  
+  rbind(df_WNV_NUTS_1950_2022%>%
+   filter(year %in% (1981:1990))%>%
+   group_by(NUTS_ID)%>%
+   summarize(pp = mean(mean_risk_prob))%>%
+   mutate(ProbYears= c("1981-1990")) )%>%
+  rbind(df_WNV_NUTS_1950_2022%>%
+   filter(year %in% (1991:2000))%>%
+   group_by(NUTS_ID)%>%
+   summarize(pp = mean(mean_risk_prob))%>%
+   mutate(ProbYears= c("1991-2000")) )%>%
+ rbind(df_WNV_NUTS_1950_2022%>%
+   filter(year %in% (2001:2010))%>%
+   group_by(NUTS_ID)%>%
+   summarize(pp = mean(mean_risk_prob))%>%
+   mutate(ProbYears= c("2001-2010")) )%>%
+   rbind(
+     df_WNV_NUTS_1950_2022%>%
+       filter(year %in% (2011:2022))%>%
+       group_by(NUTS_ID)%>%
+       summarize(pp = mean(mean_risk_prob))%>%
+       mutate(ProbYears= c("2011-2022"))
+     )
+  
+
+#df_wnv_proj_prob_maps <-   left_join(  europe_shp21[,c("NUTS_ID", "geometry")],df_LCD_meanprbs_7tmprlgrps, 
+#                              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+#                              all.y=TRUE )
+ 
+
+```
+
+##  Appendix Figure Maps : Figure#2
+```{r}
+
+library(eurostat)
+library(ggthemes)
+EU_NUTS3 <- get_eurostat_geospatial(resolution = 10,nuts_level = 3, 
+                                    year = 2021)%>%
+  mutate(long= st_coordinates(st_centroid(EU_NUTS3$geometry))[1])%>%
+  mutate(lat= st_coordinates(st_centroid(EU_NUTS3$geometry))[2])#%>%
+  
+
+EU_Cntry_bndries <- get_eurostat_geospatial(resolution = 10,nuts_level = 0, 
+                                            year = 2021)%>%
+  mutate(long= st_coordinates(st_centroid(geometry))[1])%>%
+  mutate(lat= st_coordinates(st_centroid(geometry))[2])
+
+plot_decadal_change_risk<- 
+  #df_wnv_proj_prob_maps%>%
+
+  df_LCD_meanprbs_7tmprlgrps%>%
+  mutate(`WNV outbreak risk`=pp)%>%
+  mutate(ProbYears= as.factor(ProbYears))%>%
+  left_join(  EU_NUTS3[,c("NUTS_ID", "geometry")], 
+              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+              all.y=TRUE )%>%
+  
+  ggplot()+ 
+  geom_sf(aes(geometry = geometry, fill=`WNV outbreak risk`),  color=NA)+# color=NA
+  #geom_sf(data= EU_NUTS3%>%na.omit(), aes(geometry = geometry, fill=NA),color = "#D55E00",size=0.3)+ #, fill = "Reg"
+  #geom_sf(data=EU_Cntry_bndries, aes(geometry = geometry, fill=NA),color="#009E73",size=0.3)+
+  #scale_fill_manual(values = c("green", "yellow", "grey"))+
+  #theme_bw()+
+scale_fill_viridis_c(option = "B", direction = -1,alpha = 1)+
+
+  #scale_fill_tableau()+
+  #scale_fill_colorblind()+
+  #scale_fill_manual(values = c(viridis::viridis(6)[1:3]))+ 
+  #scale_fill_viridis_d(option = "D")+
+  theme_map()+
+  facet_wrap("ProbYears")+
+  #facet_grid(vars(Period),vars(Model_scenario))+
+  labs(color="WNV outbreak risk")+
+  theme( 
+    legend.direction = "horizontal",
+    legend.position =c(0.5,0.2) ,#"bottom",#
+    legend.box.background = element_blank(),
+    #legend.spacing.y = unit(-0.1, 'cm'),
+    legend.background=element_blank(),
+    #legend.box.spacing = unit(5, 'cm'),
+    strip.background = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    #legend.title = element_text(size=10),
+    legend.text=element_text(size=10),
+    strip.text = element_text(size=10, face = "bold"),
+    strip.text.y = element_text(size=10, face = "bold"),
+    ##legend.key = element_blank(),
+    #legend.title = element_blank(),         
+    #plot.subtitle =   element_text(hjust = 0, face= "italic"),
+    legend.box = "vertical"
+  )+
+  
+  scale_y_continuous( limits=c(30,70.7), 
+                      # breaks = c(30,40,50),
+                      expand = c(0, 0)
+  ) +
+  
+  scale_x_continuous(  limits= c(-12,46), #c(-30,55),
+                       expand = c(0, 0))#+
+
+ #bitmap("WNV_riskMAP_1950to2019.png",width=7,height=5,units='in',res=300,type="pngalpha",pointsize=13)
+ #Maps_WNV_Risk_7grps
+ #dev.off()
+ 
+
+
+```
+
+#Correlation plot- Appendix Figure#3
+
+```{r}
+ 
+
+df_means_pred_resp <- LCD_all_data%>%
+  #dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+     #      dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+  #filter(EU_reg=="All Europe")%>%
+  group_by(year)%>%
+  #mutate(ssp_rcp= as.factor(SSP_RCP))%>%
+  summarise_at(vars(mean_temp_Q02, pred_prob ), ~ mean(.x, na.rm = TRUE))#%>%
+  
+ggscatter(df_means_pred_resp,
+            #filter(EU_reg!= "All Europe" ),
+          #filter(RCP!= "ERA5"),#%>%
+          x = "mean_temp_Q02", y = "pred_prob", 
+          add = "reg.line", conf.int = TRUE,
+          cor.coef = TRUE, 
+          cor.method = "pearson",
+          xlab = "Average spring temperature", ylab = "WNV outbreak risk")
+
+```
+
+```{r}
+#EU_NUTS3_UrbanRural <- st_read('/Users/ziafarooq/Old_Mac/Umu_PhD/LCD_Europe/LCDE_2024/EU_NUTS3_Urban_rural/eu_nuts3.shp')
+
+
+
+ LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+arrange(NUTS_ID,year) %>% 
+left_join(  EU_NUTS3[,c("NUTS_ID", "geometry", "URBN_TYPE")], 
+              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+              all.y=TRUE )%>%
+ filter(  year != 1950)%>%
+  
+mutate(URBN_TYPE= as.factor(URBN_TYPE))%>%
+ mutate(URBN_TYPE= recode_factor(URBN_TYPE , `1`= "Urban", `2` = "Intermediate", `3` = "Rural"))%>%
+mutate(`Topology type`= (URBN_TYPE))%>%
+ # filter(NUTS_ID %in% unique(df_WNVCases_2010_22$NUTS_ID))%>%
+  group_by(year,`Topology type`)%>%
+  summarize(m_prob=mean(pred_prob))%>%
+ ggplot(aes(year , 
+            m_prob, color=`Topology type`))+
+   geom_line()+
+  
+  
+  
+  scale_color_ptol()+
+   geom_smooth(
+     method=lm,
+               aes(year , 
+                   m_prob, 
+                   color=`Topology type`,
+                   group=`Topology type`
+                   ),
+               alpha=0.1,
+               lty=2,lwd=1,
+               se = FALSE,
+   )+
+  theme_bw()+
+   scale_x_continuous(breaks=seq(1950,2020,10)#,  
+                      )+
+   xlab(" ")+
+   
+   ylab("WNV outbreak risk")+
+   theme(
+         strip.text =element_text(hjust =0),
+         legend.key =element_blank(),
+         legend.text.align =0,
+         panel.grid =element_blank(),
+         legend.key.height =grid::unit(0.2,'cm'),
+         legend.position =  "bottom", #c(0.5, 0.95),## 
+         legend.direction = "horizontal",
+         legend.title = element_blank(),         
+         axis.text =element_text(vjust=0.5,size=10),
+         panel.border =element_blank(),
+         axis.line.y.left =element_line(size=0.1),
+         axis.line.x.bottom =element_line(size=0.1))
+
+
+
+```
+# Fig Appendix Landuse/Topological trends (Figure A2)
+
+```{r}
+
+df_WNVposRegs_topolgy <- 
+LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+arrange(NUTS_ID,year) %>% 
+left_join(  EU_NUTS3[,c("NUTS_ID", "URBN_TYPE")], 
+              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+              all.y=TRUE )%>%
+ filter(  year %in% (2010:2022))%>%
+  
+mutate(URBN_TYPE= as.factor(URBN_TYPE))%>%
+ mutate(URBN_TYPE= recode_factor(URBN_TYPE , `1`= "Urban", `2` = "Intermediate", `3` = "Rural"))%>%
+mutate(`Topology type`= (URBN_TYPE))%>%
+  filter(wnf_case==1)%>%
+  group_by(year,`Topology type`)%>%
+  count()
+
+df_trends_topolgical <- 
+LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+arrange(NUTS_ID,year) %>% 
+left_join(  EU_NUTS3[,c("NUTS_ID", "geometry", "URBN_TYPE")], 
+              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+              all.y=TRUE )%>%
+ filter(  year != 1950)%>%
+  
+mutate(URBN_TYPE= as.factor(URBN_TYPE))%>%
+ mutate(URBN_TYPE= recode_factor(URBN_TYPE , `1`= "Urban", `2` = "Intermediate", `3` = "Rural"))%>%
+mutate(`Topology type`= (URBN_TYPE))%>%
+ # filter(NUTS_ID %in% unique(df_WNVCases_2010_22$NUTS_ID))%>%
+  group_by(year,`Topology type`)%>%
+  summarize(m_prob=mean(pred_prob))
+
+ scal_factor= max(df_WNVposRegs_topolgy$n)/max(df_trends_topolgical$m_prob)
+  
+ 
+ #LCD_fig_WNVTopTrends_posRegs.pdf
+ 
+ p2 <- df_trends_topolgical%>%
+ ggplot(aes(year , 
+            m_prob, color=`Topology type`))+
+   geom_line(alpha=0.5)+
+  scale_color_ptol()+
+   geom_smooth(
+     method=lm,
+               aes(year , 
+                   m_prob, 
+                   color=`Topology type`,
+                   group=`Topology type`
+                   ),
+               alpha=0.9,
+               lty=2,lwd=1,
+               se = FALSE,
+   )+
+   geom_bar(df_WNVposRegs_topolgy, mapping= aes(year , 
+           # n/scal_factor, 
+            n/4000, 
+            fill=`Topology type`
+          
+  ), 
+  # geom='GeomBar',
+  stat='identity',
+  position ='stack',
+  alpha=0.5,
+  colour= NA
+  #alpha=0.1
+  )+ #as.numeric(alpha) 1500
+  theme_bw()+
+   scale_fill_ptol()+
+
+  scale_x_continuous(expand = c(0,0),
+    breaks=seq(1950,2020,10)#,  
+                      )+
+
+   xlab(" ")+
+   ylab("West Nile virus outbreak risk")+
+   theme(
+         strip.text =element_text(hjust =0),
+         legend.key =element_blank(),
+         legend.text.align =0,
+         panel.grid =element_blank(),
+         legend.key.height =grid::unit(0.2,'cm'),
+         legend.position =  "bottom", #c(0.5, 0.95),## 
+         legend.direction = "horizontal",
+         legend.title = element_blank(),         
+         axis.text =element_text(vjust=0.5,size=10),
+         panel.border =element_blank(),
+         axis.line.y.right = element_line(size=0.1),
+         axis.line.y.left =element_line(size=0.1),
+         axis.line.x.bottom =element_line(size=0.1),
+         axis.ticks.y.right = element_line(color = "black"),
+    axis.title.y.right = element_text(color = "black", size = 10)
+         )+
+   scale_y_continuous( #limits = c(-60, 60),
+     expand = c(0,0),
+    sec.axis = sec_axis( trans=~.*4000, # scal_factor,
+                         name="Number of NUTS3 regions reporting West Nile virus outbreaks"
+    )
+  )
+ 
+   
+   
+```
+
+
+# Fig Topolgies
+
+```{r}
+df_WNVposRegs_topolgy <- 
+LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009, 2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+arrange(NUTS_ID,year) %>% 
+left_join(  EU_NUTS3[,c("NUTS_ID", "URBN_TYPE")], 
+              by.x= c("NUTS_ID"), by.y= c("NUTS_ID"),
+              all.y=TRUE )%>%
+ filter(  year %in% (2010:2022))%>%
+  
+mutate(URBN_TYPE= as.factor(URBN_TYPE))%>%
+ mutate(URBN_TYPE= recode_factor(URBN_TYPE , `1`= "Urban", `2` = "Intermediate", `3` = "Rural"))%>%
+mutate(`Topology type`= (URBN_TYPE))%>%
+  filter(wnf_case==1)%>%
+  group_by(year,`Topology type`)%>%
+  count()%>%
+ ggplot(aes(year , 
+            n, 
+            fill=`Topology type`
+            #shape=`Topology type`
+            ))+
+  # geom_point(size=5)+
+  theme_bw()+
+  scale_fill_ptol()+
+  geom_bar(position="dodge", stat="identity")+
+  #facet_wrap("Topology type")+
+   scale_x_continuous(breaks=seq(2010,2022,1)#,  
+                      )+
+   xlab(" ")+
+   
+   ylab("Number of NUTS3 reporting West Nile transmission ")+
+   theme(
+         strip.text =element_text(hjust =0),
+         legend.key =element_blank(),
+         legend.text.align =0,
+         panel.grid =element_blank(),
+         legend.key.height =grid::unit(0.2,'cm'),
+         legend.position =  "bottom", #c(0.5, 0.95),## 
+         legend.direction = "horizontal",
+         legend.title = element_blank(),         
+         axis.text =element_text(vjust=0.5,size=10),
+         panel.border =element_blank(),
+         axis.line.y.left =element_line(size=0.1),
+         axis.line.x.bottom =element_line(size=0.1))
+
+```
+
+
+
+```{r}
+library(ggpubr)
+library(survminer)
+countries_with_WNV_transmission=  LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(wnf_case==1)%>%
+  filter(year %in% c(2010:2019))
+
+  WNV_effected_countries<- unique(countries_with_WNV_transmission$CNTR_CODE)
+
+df_wnv_pred_probs <- LCD_all_data%>%
+  dplyr::select(c(1:4,45))%>%
+  filter(year %in% c(1950:2009,2020:2022))%>%
+  filter(str_length(NUTS_ID)>4)%>%
+  mutate(pred_prob= LCD_xgb_pred)%>%
+  rbind( LCD_all_data%>%
+           dplyr::select(c(1:4,45))%>%
+           filter(year %in% c(2010:2019))%>%
+           filter(str_length(NUTS_ID)>4)%>%
+           mutate(pred_prob= LCD_xgbcv$pred)
+         )%>%
+    arrange(NUTS_ID,year)%>%
+  filter(CNTR_CODE %in% WNV_effected_countries)%>%
+  group_by(year, CNTR_CODE)%>%
+  summarize(m_prob=mean(pred_prob) )%>%
+ 
+  ggplot(aes(year , 
+             m_prob#,
+             #group=wnf_case,
+             #color= wnf_case#, 
+                       ))+
+  geom_line()+
+  geom_smooth(alpha=0.5,
+               lty=1,
+              lwd=1.5,
+               se = FALSE,
+    )+
+  facet_wrap("CNTR_CODE",scales = "free_y")+
+#scale_fill_manual(values = c("#0073C2FF", "#EFC000FF"))+
+  theme_bw()+
+  #theme_classic2()+
+   scale_x_continuous(breaks=seq(1950,2020,10)#,  
+                      )+
+   xlab(" ")+
+   
+   ylab("WNV outbreak risk")+
+   theme(
+        # strip.text =element_text(hjust =0),
+         legend.key =element_blank(),
+         strip.background = element_blank(),
+         strip.text = element_text(size=10, face = "bold"),
+         strip.text.y = element_text(size=10, face = "bold"),
+         legend.text.align =0,
+         panel.grid =element_blank(),
+         legend.key.height =grid::unit(0.2,'cm'),
+         legend.position =  "bottom", #c(0.5, 0.95),## 
+         legend.direction = "horizontal",
+         axis.text.x = element_text(angle = 90, size = 10,vjust = 0.3),
+         legend.title = element_blank(),         
+         axis.text =element_text(vjust=0.5,size=10),
+         panel.border =element_blank(),
+         axis.line.y.left =element_line(size=0.1),
+         axis.line.x.bottom =element_line(size=0.1))
+  
+  
+```
+
